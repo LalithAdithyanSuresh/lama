@@ -9,6 +9,7 @@ from saicinpainting.training.losses.distance_weighting import make_mask_distance
 from saicinpainting.training.losses.feature_matching import feature_matching_loss, masked_l1_loss
 from saicinpainting.training.modules.fake_fakes import FakeFakesGenerator
 from saicinpainting.training.trainers.base import BaseInpaintingTrainingModule, make_multiscale_noise
+from saicinpainting.training.losses.advanced_losses import HighFrequencyLoss, BoundaryLoss
 from saicinpainting.utils import add_prefix_to_keys, get_ramp
 
 LOGGER = logging.getLogger(__name__)
@@ -43,6 +44,10 @@ class DefaultInpaintingTrainingModule(BaseInpaintingTrainingModule):
         self.fake_fakes_proba = fake_fakes_proba
         if self.fake_fakes_proba > 1e-3:
             self.fake_fakes_gen = FakeFakesGenerator(**(fake_fakes_generator_kwargs or {}))
+
+        # Advanced Losses
+        self.loss_hf = HighFrequencyLoss(weight=kwargs.get('hf_loss_weight', 10.0))
+        self.loss_boundary = BoundaryLoss(weight=kwargs.get('boundary_loss_weight', 5.0))
 
     def forward(self, batch):
         if self.training and self.rescale_size_getter is not None:
@@ -112,21 +117,44 @@ class DefaultInpaintingTrainingModule(BaseInpaintingTrainingModule):
                                                  generator=self.generator, discriminator=self.discriminator)
         discr_real_pred, discr_real_features = self.discriminator(img)
         discr_fake_pred, discr_fake_features = self.discriminator(predicted_img)
-        adv_gen_loss, adv_metrics = self.adversarial_loss.generator_loss(real_batch=img,
-                                                                         fake_batch=predicted_img,
-                                                                         discr_real_pred=discr_real_pred,
-                                                                         discr_fake_pred=discr_fake_pred,
-                                                                         mask=mask_for_discr)
+        
+        # Multi-scale GAN support
+        if isinstance(discr_real_pred, list):
+            adv_gen_loss = 0
+            adv_metrics = {}
+            for i, (drp, dfp) in enumerate(zip(discr_real_pred, discr_fake_pred)):
+                cur_adv_loss, cur_metrics = self.adversarial_loss.generator_loss(real_batch=img,
+                                                                                 fake_batch=predicted_img,
+                                                                                 discr_real_pred=drp,
+                                                                                 discr_fake_pred=dfp,
+                                                                                 mask=mask_for_discr)
+                adv_gen_loss = adv_gen_loss + cur_adv_loss
+                adv_metrics.update(add_prefix_to_keys(cur_metrics, f'scale_{i}_'))
+        else:
+            adv_gen_loss, adv_metrics = self.adversarial_loss.generator_loss(real_batch=img,
+                                                                             fake_batch=predicted_img,
+                                                                             discr_real_pred=discr_real_pred,
+                                                                             discr_fake_pred=discr_fake_pred,
+                                                                             mask=mask_for_discr)
+        
         total_loss = total_loss + adv_gen_loss
         metrics['gen_adv'] = adv_gen_loss
         metrics.update(add_prefix_to_keys(adv_metrics, 'adv_'))
 
-        # feature matching
+        # feature matching (handle nested features if multi-scale)
         if self.config.losses.feature_matching.weight > 0:
             need_mask_in_fm = OmegaConf.to_container(self.config.losses.feature_matching).get('pass_mask', False)
             mask_for_fm = supervised_mask if need_mask_in_fm else None
-            fm_value = feature_matching_loss(discr_fake_features, discr_real_features,
-                                             mask=mask_for_fm) * self.config.losses.feature_matching.weight
+            
+            if isinstance(discr_real_features[0], list): # Multi-scale features
+                fm_value = 0
+                for drf, dff in zip(discr_real_features, discr_fake_features):
+                    fm_value = fm_value + feature_matching_loss(dff, drf, mask=mask_for_fm)
+                fm_value = fm_value * self.config.losses.feature_matching.weight / len(discr_real_features)
+            else:
+                fm_value = feature_matching_loss(discr_fake_features, discr_real_features,
+                                                 mask=mask_for_fm) * self.config.losses.feature_matching.weight
+            
             total_loss = total_loss + fm_value
             metrics['gen_fm'] = fm_value
 
@@ -134,6 +162,16 @@ class DefaultInpaintingTrainingModule(BaseInpaintingTrainingModule):
             resnet_pl_value = self.loss_resnet_pl(predicted_img, img)
             total_loss = total_loss + resnet_pl_value
             metrics['gen_resnet_pl'] = resnet_pl_value
+
+        # High-Frequency Loss
+        hf_loss = self.loss_hf(predicted_img, img, mask=supervised_mask)
+        total_loss = total_loss + hf_loss
+        metrics['gen_hf'] = hf_loss
+
+        # Boundary Loss
+        boundary_loss = self.loss_boundary(predicted_img, img, mask=original_mask)
+        total_loss = total_loss + boundary_loss
+        metrics['gen_boundary'] = boundary_loss
 
         return total_loss, metrics
 
@@ -146,11 +184,25 @@ class DefaultInpaintingTrainingModule(BaseInpaintingTrainingModule):
                                                      generator=self.generator, discriminator=self.discriminator)
         discr_real_pred, discr_real_features = self.discriminator(batch['image'])
         discr_fake_pred, discr_fake_features = self.discriminator(predicted_img)
-        adv_discr_loss, adv_metrics = self.adversarial_loss.discriminator_loss(real_batch=batch['image'],
-                                                                               fake_batch=predicted_img,
-                                                                               discr_real_pred=discr_real_pred,
-                                                                               discr_fake_pred=discr_fake_pred,
-                                                                               mask=batch['mask'])
+        
+        if isinstance(discr_real_pred, list):
+            adv_discr_loss = 0
+            adv_metrics = {}
+            for i, (drp, dfp) in enumerate(zip(discr_real_pred, discr_fake_pred)):
+                cur_adv_loss, cur_metrics = self.adversarial_loss.discriminator_loss(real_batch=batch['image'],
+                                                                                     fake_batch=predicted_img,
+                                                                                     discr_real_pred=drp,
+                                                                                     discr_fake_pred=dfp,
+                                                                                     mask=batch['mask'])
+                adv_discr_loss = adv_discr_loss + cur_adv_loss
+                adv_metrics.update(add_prefix_to_keys(cur_metrics, f'scale_{i}_'))
+        else:
+            adv_discr_loss, adv_metrics = self.adversarial_loss.discriminator_loss(real_batch=batch['image'],
+                                                                                   fake_batch=predicted_img,
+                                                                                   discr_real_pred=discr_real_pred,
+                                                                                   discr_fake_pred=discr_fake_pred,
+                                                                                   mask=batch['mask'])
+            
         total_loss = total_loss + adv_discr_loss
         metrics['discr_adv'] = adv_discr_loss
         metrics.update(add_prefix_to_keys(adv_metrics, 'adv_'))

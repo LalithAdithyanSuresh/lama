@@ -3,6 +3,7 @@ import logging
 from saicinpainting.training.modules.ffc import FFCResNetGenerator
 from saicinpainting.training.modules.pix2pixhd import GlobalGenerator, MultiDilatedGlobalGenerator, \
     NLayerDiscriminator, MultidilatedNLayerDiscriminator
+from saicinpainting.training.modules.multiscale_gan import MultiScalePatchGAN
 
 def make_generator(config, kind, **kwargs):
     logging.info(f'Make generator {kind}')
@@ -27,5 +28,8 @@ def make_discriminator(kind, **kwargs):
 
     if kind == 'pix2pixhd_nlayer':
         return NLayerDiscriminator(**kwargs)
+
+    if kind == 'multi_scale_patchgan':
+        return MultiScalePatchGAN(**kwargs)
 
     raise ValueError(f'Unknown discriminator kind {kind}')

@@ -11,6 +11,7 @@ from saicinpainting.training.modules.base import get_activation, BaseDiscriminat
 from saicinpainting.training.modules.spatial_transform import LearnableSpatialTransformWrapper
 from saicinpainting.training.modules.squeeze_excitation import SELayer
 from saicinpainting.utils import get_shape
+from saicinpainting.training.modules.mamba_2d import VisionMamba2D
 
 
 class FFCSE_block(nn.Module):
@@ -308,7 +309,8 @@ class FFCResNetGenerator(nn.Module):
                  up_norm_layer=nn.BatchNorm2d, up_activation=nn.ReLU(True),
                  init_conv_kwargs={}, downsample_conv_kwargs={}, resnet_conv_kwargs={},
                  spatial_transform_layers=None, spatial_transform_kwargs={},
-                 add_out_act=True, max_features=1024, out_ffc=False, out_ffc_kwargs={}):
+                 add_out_act=True, max_features=1024, out_ffc=False, out_ffc_kwargs={},
+                 use_mamba=False, mamba_kwargs={}):
         assert (n_blocks >= 0)
         super().__init__()
 
@@ -343,6 +345,9 @@ class FFCResNetGenerator(nn.Module):
             model += [cur_resblock]
 
         model += [ConcatTupleLayer()]
+        
+        if use_mamba:
+            model += [VisionMamba2D(feats_num_bottleneck, **mamba_kwargs)]
 
         ### upsample
         for i in range(n_downsampling):
